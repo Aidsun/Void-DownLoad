@@ -1,0 +1,29 @@
+# Build output
+dist/
+build/
+bundle/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.spec.bak
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+*.log
+__test_*.py
+__shot*.py
