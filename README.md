@@ -49,7 +49,7 @@
 | 语言 | Python 3.10+ |
 | GUI 框架 | PySide6 (Qt 6) |
 | 浏览器引擎 | Playwright (Chromium) |
-| 打包 | PyInstaller (单文件 EXE) |
+| 打包 | PyInstaller (onedir 目录分发) |
 | 样式 | QSS (类 CSS) |
 
 ---
@@ -73,16 +73,17 @@ python -m playwright install chromium
 python Void-DownLoad.py
 ```
 
-### 方式二：打包 .exe（Windows 单文件）
+### 方式二：打包 .exe 分发版（Windows）
 
 ```bash
 # 确保已安装 PyInstaller
 pip install pyinstaller
 
 # 一键打包
-build_exe.bat
+pyinstaller Void-DownLoad.spec --clean --noconfirm
 
-# 产物: dist/Void-DownLoad.exe (~264MB，自包含，无需 Python 环境)
+# 产物: dist/Void-DownLoad/ 目录 (~215MB)
+# 打 zip 分发即可，解压运行 Void-DownLoad.exe
 ```
 
 ---
@@ -123,8 +124,21 @@ playwright>=1.40.0
 
 - **操作系统**: Windows 10/11 x64
 - **Python**: 3.10 或更高
-- **磁盘空间**: ~500MB（用于 Playwright Chromium）
-- **打包后 EXE 大小**: ~264MB（自包含，无需额外环境）
+- **磁盘空间**: 系统需安装 Chrome 或 Edge 浏览器（用于页面嗅探）
+- **打包后目录大小**: ~215MB，EXE 仅 3.1MB（无需 Python 环境）
+
+---
+
+## ⚡ 优化记录
+
+| 版本 | 改动 | EXE 大小 | 启动耗时 |
+|------|------|----------|----------|
+| v1 | 初始版本（内置 Chromium 400MB + onefile） | 264 MB | 5-10s |
+| v1.1 | 移除内置 Chromium，改用系统 Chrome/Edge | 81 MB | 16s |
+| v1.2 | 切换为 onedir 目录分发，免除解压 | 3.1 MB | **3.7s** ✅ |
+
+> 💡 **核心优化**：不再将 Chromium 浏览器打包进 EXE，启动时也不需要解压。
+> 系统优先使用 Google Chrome → Microsoft Edge → Playwright 自带 Chromium。
 
 ---
 
