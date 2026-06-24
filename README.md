@@ -66,10 +66,7 @@ cd Void-DownLoad
 # 2. 安装依赖
 pip install -r requirements.txt
 
-# 3. 安装 Playwright Chromium（首次）
-python -m playwright install chromium
-
-# 4. 启动
+# 3. 启动（确保系统已安装 Chrome 或 Edge）
 python Void-DownLoad.py
 ```
 
