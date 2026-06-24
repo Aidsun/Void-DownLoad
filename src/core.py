@@ -14,6 +14,7 @@ Void-DownLoad 核心模块
 import asyncio
 import os
 import re
+import shutil
 import sys
 import time
 import urllib.request
@@ -97,78 +98,45 @@ def _human_size(n: int) -> str:
         n /= 1024
     return f"{n:.1f} PB"
 
-# ============== 找 Chromium ==============
+# ============== 浏览器检测 ==============
+
 def find_chromium_exe() -> Optional[str]:
-    """在 %LOCALAPPDATA%\\ms-playwright\\ 下找 chromium 可执行文件."""
-    # 1) 优先用 PyInstaller/frozen 內嵌的 chromium (随 exe 打包的)
-    bundled = _extract_bundled_chromium()
-    if bundled:
-        return bundled
-    # 2) 用户系统上装好的
+    """检测系统可用的浏览器(exe路径)。
+
+    优先用系统 Chrome/Edge (零额外体积,秒启动),
+    仅在两者都不可用时回退到 ms-playwright 下的 Chromium。
+    """
+    # 1) Google Chrome
+    chrome_paths = [
+        Path("C:/Program Files/Google/Chrome/Application/chrome.exe"),
+        Path("C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"),
+    ]
+    for p in chrome_paths:
+        if p.exists():
+            return str(p)
+    if shutil.which("chrome"):
+        return shutil.which("chrome")
+
+    # 2) Microsoft Edge (Win10/11 自带)
+    edge_paths = [
+        Path("C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"),
+        Path("C:/Program Files/Microsoft/Edge/Application/msedge.exe"),
+    ]
+    for p in edge_paths:
+        if p.exists():
+            return str(p)
+    if shutil.which("msedge"):
+        return shutil.which("msedge")
+
+    # 3) 回退: ms-playwright 下的 Chromium (开发环境)
     pdir = Path(os.environ.get("LOCALAPPDATA", "")) / "ms-playwright"
-    if not pdir.exists():
-        return None
-    # 1) 普通 chromium
-    for d in pdir.iterdir():
-        if d.name.startswith("chromium-") and d.is_dir():
-            for sub in (
-                d / "chrome-win64" / "chrome.exe",
-                d / "chrome-win" / "chrome.exe",
-            ):
-                if sub.exists():
-                    return str(sub)
-    # 2) headless shell
-    for d in pdir.iterdir():
-        if d.name.startswith("chromium_headless_shell-") and d.is_dir():
-            for sub in (
-                d / "chrome-headless-shell-win64" / "chrome-headless-shell.exe",
-                d / "chrome-win" / "chrome.exe",
-            ):
-                if sub.exists():
-                    return str(sub)
-    return None
+    if pdir.exists():
+        for d in pdir.iterdir():
+            if d.name.startswith("chromium-") and d.is_dir():
+                for sub in (d / "chrome-win64" / "chrome.exe", d / "chrome-win" / "chrome.exe"):
+                    if sub.exists():
+                        return str(sub)
 
-_BUNDLED_CHROMIUM_EXTRACTED = None  # cache
-
-def _extract_bundled_chromium() -> Optional[str]:
-    """从 PyInstaller 临时目录 / 开发环境 bundle/ 目录提取 chromium 到用户磁盘。"""
-    global _BUNDLED_CHROMIUM_EXTRACTED
-    if _BUNDLED_CHROMIUM_EXTRACTED:
-        if Path(_BUNDLED_CHROMIUM_EXTRACTED).exists():
-            return _BUNDLED_CHROMIUM_EXTRACTED
-        _BUNDLED_CHROMIUM_EXTRACTED = None  # 被删了, 重提
-
-    import sys as _sys
-    meipass = getattr(_sys, "_MEIPASS", None)
-    bundle_root = Path(meipass) if meipass else Path(__file__).resolve().parent.parent
-    # 优先选目录形式 (包含全部 300+ 文件)
-    chromium_dir_src = bundle_root / "bundle" / "chromium"
-    chromium_exe_src = bundle_root / "bundle" / "chromium.exe"
-
-    # 解到 %LOCALAPPDATA%\Void-DownLoad\chromium\
-    dest_dir = Path(os.environ.get("LOCALAPPDATA", "")) / "Void-DownLoad" / "chromium"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
-    if chromium_dir_src.is_dir() and (chromium_dir_src / "chrome.exe").exists():
-        # 整个目录打包形式 (spec 里 datas=('bundle/chromium', 'bundle/chromium'))
-        src_dir = chromium_dir_src
-        src_chrome = src_dir / "chrome.exe"
-        dest = dest_dir / "chrome.exe"
-        if not dest.exists() or dest.stat().st_size != src_chrome.stat().st_size:
-            import shutil
-            if dest_dir.exists():
-                shutil.rmtree(dest_dir, ignore_errors=True)
-            shutil.copytree(src_dir, dest_dir)
-        _BUNDLED_CHROMIUM_EXTRACTED = str(dest)
-        return _BUNDLED_CHROMIUM_EXTRACTED
-    elif chromium_exe_src.is_file():
-        # 单文件形式 (备用)
-        dest = dest_dir / "chrome.exe"
-        if not dest.exists() or dest.stat().st_size != chromium_exe_src.stat().st_size:
-            import shutil
-            shutil.copy2(chromium_exe_src, dest)
-        _BUNDLED_CHROMIUM_EXTRACTED = str(dest)
-        return _BUNDLED_CHROMIUM_EXTRACTED
     return None
 
 # ============== HEAD 估大小 ==============
@@ -208,12 +176,19 @@ URL_PATTERN = re.compile(r"^https?://(www\.)?bosch-pt\.com\.cn/", re.IGNORECASE)
 POLL_TIMEOUT = 90
 
 async def extract_via_playwright(page_url: str, log=None) -> list[MediaItem]:
-    """打开页面, 触发 jwplayer, 提取所有可见媒体资源。"""
+    """打开页面, 触发 jwplayer, 提取所有可见媒体资源。
+
+    优先复用系统 Chrome/Edge (零额外下载,秒启动),
+    仅在没有系统浏览器时才用 Playwright 自带 Chromium。
+    """
     from playwright.async_api import async_playwright
 
     items: list[MediaItem] = []
 
-    chromium_exe = find_chromium_exe()
+    browser_exe = find_chromium_exe()
+    if log:
+        log(f"浏览器: {browser_exe or '(使用 Playwright 默认 Chromium)'}")
+
     launch_kwargs = dict(
         headless=True,
         args=[
@@ -223,8 +198,9 @@ async def extract_via_playwright(page_url: str, log=None) -> list[MediaItem]:
             "--autoplay-policy=no-user-gesture-required",
         ],
     )
-    if chromium_exe:
-        launch_kwargs["executable_path"] = chromium_exe
+    # 用系统浏览器 (不需要额外下载 400MB Chromium)
+    if browser_exe:
+        launch_kwargs["executable_path"] = browser_exe
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**launch_kwargs)
