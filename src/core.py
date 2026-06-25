@@ -13,6 +13,7 @@ Void-DownLoad 核心模块
 
 import asyncio
 import os
+import random
 import re
 import shutil
 import sys
@@ -377,6 +378,494 @@ async def extract_via_playwright(page_url: str, log=None) -> list[MediaItem]:
 
     return items
 
+# ============== 淘宝 / 天猫提取 ==============
+
+TAOBAO_URL_PATTERN = re.compile(
+    r'(?:item\.taobao|detail\.tmall|h5\.m\.taobao)\.com',
+    re.IGNORECASE
+)
+
+# 淘宝视频 CDN 域名特征
+_VIDEO_CDN_PATTERNS = (
+    "cloudvideo.taobao.com",
+    "cloud.video.taobao.com",
+    "vod.taobao.com",
+    "tbm.alicdn.com",     # 天猫视频
+    "tb-video.bdstatic.com",
+)
+
+_VIDEO_EXT_PATTERN = re.compile(r'\.(mp4|webm|mkv|mov|m4v|flv|ts)(\?|$)', re.I)
+_SIZE_SUFFIX_PAT = re.compile(r'_\d+x\d+.*?(\.[a-z]+)', re.I)
+_SIZE_DOT_PAT = re.compile(r'\.\d+x\d+', re.I)
+
+
+def _clean_image_url(url: str) -> str:
+    """去掉阿里 CDN 图片的尺寸后缀, 拿到原图 URL."""
+    clean = re.sub(_SIZE_SUFFIX_PAT, r'\1', url, flags=re.I)
+    clean = re.sub(_SIZE_DOT_PAT, '', clean)
+    return clean
+
+
+def is_taobao_url(url: str) -> bool:
+    """检测是否为淘宝/天猫商品链接."""
+    return bool(TAOBAO_URL_PATTERN.search(url.lower()))
+
+
+async def extract_taobao(page_url: str, log=None) -> list[MediaItem]:
+    """提取淘宝/天猫商品页的图片和视频。
+
+    优先使用 CDP 连接到用户已登录的 Chrome (端口 9222),
+    这样完全复用用户的真实浏览器会话, 零反爬风险。
+
+    图片: 三层提取 (网络拦截 + DOM 提取 + 缩略图点击)
+    视频: 四层提取 (网络拦截 CDN + JS 深度探测 + DOM 扫描 + 播放器触发)
+    """
+    from playwright.async_api import async_playwright
+
+    items: list[MediaItem] = []
+    _ll = (lambda m: log(m)) if log else (lambda m: None)
+    page = None
+
+    async with async_playwright() as pw:
+        # 尝试 CDP 连接用户浏览器
+        try:
+            browser = await pw.chromium.connect_over_cdp("http://localhost:9222")
+            _ll("✅ 已连接用户浏览器 (CDP), 使用已登录的淘宝会话")
+            contexts = browser.contexts
+            ctx = contexts[0] if contexts else None
+            if ctx is None:
+                raise RuntimeError("无法获取浏览器上下文")
+            page = await ctx.new_page()
+        except Exception as e:
+            # 回退: 启动新浏览器
+            _ll("未检测到 CDP 连接 (端口 9222), 启动新浏览器…")
+            _ll("  (首次使用需要手动登录淘宝)")
+            browser_exe = find_chromium_exe()
+            launch_kwargs: dict = dict(
+                headless=False,
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--start-maximized",
+                ],
+            )
+            if browser_exe:
+                launch_kwargs["executable_path"] = browser_exe
+            browser = await pw.chromium.launch(**launch_kwargs)
+            ctx = await browser.new_context(
+                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/131.0.0.0 Safari/537.36"),
+                viewport={"width": 1280, "height": 800},
+                locale="zh-CN",
+            )
+            page = await ctx.new_page()
+
+        try:
+            # 注入反检测脚本 (在导航前注入)
+            await page.goto("about:blank")
+            await page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.chrome = {runtime: {}};
+            """)
+
+            _ll("正在加载商品页…")
+            try:
+                await page.goto(
+                    page_url,
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+            except Exception as e:
+                _ll(f"页面加载: {e}")
+
+            # 等 3 秒让 JS 渲染
+            await page.wait_for_timeout(3000)
+
+            # 提取商品标题
+            title = ""
+            try:
+                for sel in (
+                    "h1[data-spm='1000983']",
+                    ".tb-main-title",
+                    "h1",
+                ):
+                    el = await page.query_selector(sel)
+                    if el:
+                        t = await el.inner_text()
+                        title = t.strip()[:60] if t else ""
+                        if title:
+                            break
+            except Exception:
+                pass
+
+            # ================================================
+            # 网络拦截: 图片 + 视频 双通道
+            # ================================================
+            captured_images: set = set()
+            captured_videos: set = set()
+
+            def on_response(resp):
+                try:
+                    rurl = resp.url
+                    ctype = resp.headers.get("content-type", "")
+
+                    # --- 图片 ---
+                    if ctype.startswith("image/") and "alicdn.com" in rurl:
+                        captured_images.add(_clean_image_url(rurl))
+
+                    # --- 视频 CDN ---
+                    if any(pat in rurl for pat in _VIDEO_CDN_PATTERNS):
+                        captured_videos.add(rurl)
+                        return
+
+                    # --- 视频 Content-Type ---
+                    if ctype.startswith("video/") or "octet-stream" in ctype:
+                        if _VIDEO_EXT_PATTERN.search(rurl):
+                            captured_videos.add(rurl)
+                            return
+
+                    # --- .mp4/.webm/.m3u8 结尾的请求 (任何 CDN) ---
+                    if _VIDEO_EXT_PATTERN.search(rurl):
+                        captured_videos.add(rurl)
+                except Exception:
+                    pass
+
+            page.on("response", on_response)
+
+            # ================================================
+            # 第 1 层交互: 模拟人类滚动, 触发懒加载
+            # ================================================
+            _ll("  滚动页面, 触发懒加载…")
+            for pct in (0.3, 0.6, 1.0):
+                await page.evaluate(
+                    f"window.scrollTo(0, document.body.scrollHeight * {pct})"
+                )
+                await page.wait_for_timeout(500 + random.randint(300, 1200))
+
+            # ================================================
+            # 第 2 层交互: 尝试触发主图视频
+            # ================================================
+            _ll("  尝试触发商品视频播放器…")
+            try:
+                # 淘宝主图视频通常有一个 play 按钮或 video 容器
+                video_triggered = await page.evaluate("""
+                    () => {
+                        // 尝试点击视频播放按钮
+                        const selectors = [
+                            '#J_ImgBooth .tb-video-play',
+                            '.tb-video',
+                            '[class*="videoPlay"]',
+                            '[class*="video-play"]',
+                            '.tb-main-video',
+                            '#J_Video',
+                            '[data-spm="video"]',
+                            '.J_VideoBooth',
+                            '[class*="J_ItemVideo"]',
+                        ];
+                        for (const sel of selectors) {
+                            const el = document.querySelector(sel);
+                            if (el) {
+                                el.click();
+                                return sel;
+                            }
+                        }
+                        // 检查是否有 video 标签, 有就 play
+                        const v = document.querySelector('video');
+                        if (v) { v.play(); return 'video tag found'; }
+                        return null;
+                    }
+                """)
+                if video_triggered:
+                    _ll(f"    触发: {video_triggered}")
+                    await page.wait_for_timeout(3000)  # 等视频加载
+            except Exception:
+                pass
+
+            # ================================================
+            # 第 3 层交互: 缩略图点击 (触发不同 SKU 图)
+            # ================================================
+            _ll("  点击 SKU 缩略图, 触发多规格图片…")
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(1000)
+            try:
+                thumbs = []
+                for sel in (
+                    "#J_UlThumb li",
+                    "#J_UlThumb a",
+                    ".tb-thumb-item",
+                    ".tb-thumb-content li",
+                    "[class*='thumbItem']",
+                    "ul[id*='Thumb'] li",
+                ):
+                    thumbs = await page.query_selector_all(sel)
+                    if thumbs:
+                        break
+                for i, t in enumerate((thumbs or [])[:8]):
+                    try:
+                        await t.click(timeout=800)
+                        await page.wait_for_timeout(250 + random.randint(100, 400))
+                        if i == 0:
+                            _ll(f"    找到 {len(thumbs)} 个缩略图")
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # 等待网络请求全部完成
+            await page.wait_for_timeout(3000)
+
+            # ================================================
+            # DOM 提取: 图片 (三层覆盖)
+            # ================================================
+            dom_images: set = set()
+
+            # 1) 主图容器
+            try:
+                for sel in (
+                    "#J_ImgBooth",
+                    "#J_ImgBooth img",
+                    "#J_UlThumb img",
+                    "#J_UlThumb [data-src]",
+                    "img[src*='alicdn.com']",
+                    "[data-src*='alicdn.com']",
+                    ".J_ImgBooth img",
+                    "[class*='ImgBooth'] img",
+                ):
+                    els = await page.query_selector_all(sel)
+                    for el in els:
+                        src = (
+                            await el.get_attribute("src")
+                            or await el.get_attribute("data-src")
+                            or await el.get_attribute("data-ks-lazyload")
+                            or await el.get_attribute("data-original")
+                        )
+                        if src and not src.startswith("data:") and "alicdn.com" in src:
+                            dom_images.add(_clean_image_url(src))
+            except Exception:
+                pass
+
+            # 2) 详情页图片
+            try:
+                for sel in (
+                    "#J_DivItemDesc img",
+                    "#description img",
+                    "div[class*='desc'] img",
+                    "div[id*='desc'] img",
+                    "div[id*='detail'] img",
+                ):
+                    els = await page.query_selector_all(sel)
+                    for el in els:
+                        src = (
+                            await el.get_attribute("data-src")
+                            or await el.get_attribute("src")
+                            or await el.get_attribute("data-original")
+                        )
+                        if src and not src.startswith("data:") and "alicdn.com" in src:
+                            captured_images.add(src)
+            except Exception:
+                pass
+
+            # 3) Open Graph / meta 图中重定向的原图
+            try:
+                meta_img = await page.query_selector(
+                    'meta[property="og:image"], meta[name="twitter:image"]'
+                )
+                if meta_img:
+                    src = await meta_img.get_attribute("content")
+                    if src and "alicdn.com" in src:
+                        captured_images.add(_clean_image_url(src))
+            except Exception:
+                pass
+
+            # 合并去重
+            all_images = dom_images | captured_images
+
+            # ================================================
+            # 视频提取 (四层)
+            # ================================================
+            video_urls: set = set()
+
+            # 1) 网络拦截的 CDN 视频 (已在 captured_videos 中)
+            video_urls |= captured_videos
+
+            # 2) DOM 扫描 video 元素 (扩展选择器)
+            try:
+                for sel in (
+                    "video source[src]",
+                    "video[src]",
+                    "video",
+                    "video source[data-src]",
+                    "[class*='video'] source",
+                    "[id*='Video'] source",
+                    "[id*='video'] source",
+                ):
+                    els = await page.query_selector_all(sel)
+                    for el in els:
+                        src = (
+                            await el.get_attribute("src")
+                            or await el.get_attribute("data-src")
+                        )
+                        if src and not src.startswith("data:") and not src.startswith("blob:"):
+                            video_urls.add(src)
+                        # 也检查 video 标签自身的 poster (偶尔含视频信息)
+                        poster = await el.get_attribute("poster")
+                        if poster and not poster.startswith("data:"):
+                            captured_images.add(poster)
+            except Exception:
+                pass
+
+            # 3) JS 深度探测: 从页面数据对象中挖视频
+            try:
+                js_videos = await page.evaluate("""
+                    () => {
+                        const found = [];
+                        const seen = new Set();
+
+                        // 淘宝 g_config / __INIT_DATA__
+                        const configs = [window.g_config, window.__INIT_DATA__,
+                                         window.__data, window.__PRELOADED_STATE__,
+                                         window._config, window.pageConfig];
+                        for (const cfg of configs) {
+                            if (!cfg) continue;
+                            const s = JSON.stringify(cfg);
+                            const re = /https?:\\/\\/[^"\\s,}]+\\.(mp4|webm|m3u8)[^"\\s,}]*/gi;
+                            let m;
+                            while ((m = re.exec(s)) !== null) {
+                                if (!seen.has(m[0])) {
+                                    seen.add(m[0]);
+                                    found.push(m[0]);
+                                }
+                            }
+                        }
+
+                        // 扫描所有 <script type="application/json"> / <script type="text/template">
+                        const scripts = document.querySelectorAll(
+                            'script[type="application/json"], script[type="application/ld+json"], ' +
+                            'script[id*="data"], script[id*="config"]'
+                        );
+                        for (const s of scripts) {
+                            const txt = s.textContent || s.innerHTML || '';
+                            const re = /https?:\\/\\/[^"\\s,}]+\\.(mp4|webm|m3u8)[^"\\s,}]*/gi;
+                            let m;
+                            while ((m = re.exec(txt)) !== null) {
+                                if (!seen.has(m[0])) {
+                                    seen.add(m[0]);
+                                    found.push(m[0]);
+                                }
+                            }
+                        }
+
+                        // 淘宝特有: 从 __INIT_DATA__ 的 videoInfo / videoList
+                        try {
+                            const id = window.__INIT_DATA__;
+                            if (id && id.videoInfo) {
+                                const vi = id.videoInfo;
+                                if (vi.videoUrl) found.push(vi.videoUrl);
+                                if (vi.url) found.push(vi.url);
+                            }
+                        } catch(e) {}
+
+                        // TShop 全局对象 (天猫)
+                        try {
+                            if (window.g_config) {
+                                const gc = window.g_config;
+                                if (gc.videoUrl) found.push(gc.videoUrl);
+                                if (gc.videoId && gc.videoInfo) {
+                                    if (gc.videoInfo.url) found.push(gc.videoInfo.url);
+                                }
+                            }
+                        } catch(e) {}
+
+                        return [...new Set(found)];
+                    }
+                """)
+                if js_videos:
+                    _ll(f"    JS 探测到 {len(js_videos)} 个视频 URL")
+                    video_urls.update(js_videos)
+            except Exception as e:
+                _ll(f"    JS 探测出错: {e}")
+
+            # 4) 详情描述中嵌入的视频 / iframe
+            try:
+                for sel in (
+                    "#J_DivItemDesc iframe[src]",
+                    "#description iframe[src]",
+                    "div[class*='desc'] iframe[src]",
+                ):
+                    els = await page.query_selector_all(sel)
+                    for el in els:
+                        src = await el.get_attribute("src")
+                        if src:
+                            # youku/tudou 等嵌入播放器, URL 中含 vid
+                            if any(d in src for d in ("youku", "tudou", "iqiyi")):
+                                captured_images.add(src)  # 标记为可访问链接
+            except Exception:
+                pass
+
+            # ================================================
+            # 构建 MediaItem
+            # ================================================
+            idx = 0
+            for img_url in sorted(all_images):
+                idx += 1
+                label = f"{title}_{idx}" if title else f"商品图 {idx}"
+                items.append(MediaItem(
+                    url=img_url,
+                    title=label,
+                    kind="image",
+                    source_page=page_url,
+                ))
+            for vid_url in sorted(video_urls):
+                idx += 1
+                label = f"{title}_视频_{idx}" if title else f"商品视频 {idx}"
+                items.append(MediaItem(
+                    url=vid_url,
+                    title=label,
+                    kind="video",
+                    source_page=page_url,
+                ))
+
+            n_img = sum(1 for i in items if i.kind == "image")
+            n_vid = sum(1 for i in items if i.kind == "video")
+            _ll(f"提取完成: {len(items)} 个资源 ({n_img} 图 + {n_vid} 视频)")
+
+        finally:
+            if page and not page.is_closed():
+                await page.close()
+            # CDP 模式下不关闭 browser (会杀掉用户浏览器)
+            # 非 CDP 模式关闭
+            try:
+                if browser and not browser.is_connected():
+                    pass  # CDP 已断
+            except Exception:
+                pass
+
+    # 异步估大小 (并发 HEAD)
+    if items:
+        async def _head_tb(it):
+            try:
+                loop = asyncio.get_event_loop()
+                size = await loop.run_in_executor(
+                    None, estimate_size, it.url, page_url, 10
+                )
+                it.size = size
+            except Exception:
+                pass
+        await asyncio.gather(*[_head_tb(it) for it in items])
+
+    return items
+
+
+# ============== URL 分发 ==============
+
+async def extract_media(page_url: str, log=None) -> list[MediaItem]:
+    """根据 URL 自动选择提取器."""
+    if is_taobao_url(page_url):
+        return await extract_taobao(page_url, log)
+    return await extract_via_playwright(page_url, log)
+
+
 # ============== 普通下载 ==============
 def download_simple(url: str, dest: Path, referer: str = "",
                     progress_cb=None, chunk: int = 1024 * 1024) -> int:
@@ -418,11 +907,11 @@ def download_simple(url: str, dest: Path, referer: str = "",
 
 # ============== 入口 (CLI fallback) ==============
 def main():
-    url = sys.argv[1] if len(sys.argv) > 1 else input("Bosch-PT URL: ").strip()
+    url = sys.argv[1] if len(sys.argv) > 1 else input("URL (淘宝/天猫/Bosch): ").strip()
     if not url:
         print("URL 不能为空", file=sys.stderr)
         return 1
-    items = asyncio.run(extract_via_playwright(url))
+    items = asyncio.run(extract_media(url))
     print(f"\n找到 {len(items)} 个资源:")
     for i, it in enumerate(items, 1):
         print(f"  [{i}] {kind_label(it.kind):8s} {it.display_name():50s}  {it.size_str():>12s}  {it.url[:80]}")

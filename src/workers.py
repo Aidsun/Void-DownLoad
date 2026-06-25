@@ -12,7 +12,7 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
 from .core import (
-    MediaItem, extract_via_playwright, download_simple,
+    MediaItem, extract_media, download_simple,
     find_chromium_exe,
 )
 
@@ -34,8 +34,8 @@ class ExtractWorker(QThread):
             chrome = find_chromium_exe()
             if chrome:
                 self.log.emit(f"chromium: {chrome}")
-            self.progress.emit("正在打开页面并触发 jwplayer…")
-            items = asyncio.run(extract_via_playwright(self.url, log=lambda s: self.log.emit(s)))
+            self.progress.emit("正在打开页面…")
+            items = asyncio.run(extract_media(self.url, log=lambda s: self.log.emit(s)))
             self.progress.emit(f"✓ 提取完成: {len(items)} 个资源")
             self.finished_with_items.emit(items)
         except Exception as e:

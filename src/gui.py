@@ -299,11 +299,12 @@ class MainWindow(QMainWindow):
         lay.setSpacing(10)
 
         self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("粘贴 Bosch-PT / Cliplister 产品页 URL, 回车开始抓取")
+        self.url_input.setPlaceholderText("粘贴商品链接 (淘宝/天猫/Bosch), 回车开始抓取")
         self.url_input.setClearButtonEnabled(True)
         self.url_input.returnPressed.connect(self.start_extract)
 
         self.extract_btn = QPushButton("🔍 开始抓取")
+        self.extract_btn.setToolTip("淘宝商品: 请先用 chrome.exe --remote-debugging-port=9222 启动 Chrome 并登录")
         self.extract_btn.setObjectName("primaryBtn")
         self.extract_btn.setCursor(Qt.PointingHandCursor)
         self.extract_btn.setFixedWidth(120)
